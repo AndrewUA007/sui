@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use fastcrypto::traits::KeyPair as KeypairTraits;
+use fastcrypto::traits::{AllowedRng, KeyPair as KeypairTraits};
 
 use crate::{
     committee::Committee,
@@ -11,14 +11,14 @@ use std::collections::BTreeMap;
 
 pub fn make_committee_key<R>(rand: &mut R) -> (Vec<AuthorityKeyPair>, Committee)
 where
-    R: rand::CryptoRng + rand::RngCore,
+    R: AllowedRng,
 {
     make_committee_key_num(4, rand)
 }
 
 pub fn make_committee_key_num<R>(num: usize, rand: &mut R) -> (Vec<AuthorityKeyPair>, Committee)
 where
-    R: rand::CryptoRng + rand::RngCore,
+    R: AllowedRng,
 {
     let mut authorities: BTreeMap<AuthorityPublicKeyBytes, u64> = BTreeMap::new();
     let mut keys = Vec::new();

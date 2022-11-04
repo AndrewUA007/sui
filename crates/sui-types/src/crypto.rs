@@ -10,13 +10,14 @@ use fastcrypto::ed25519::{Ed25519KeyPair, Ed25519PrivateKey, Ed25519PublicKey, E
 use fastcrypto::secp256k1::{
     Secp256k1KeyPair, Secp256k1PrivateKey, Secp256k1PublicKey, Secp256k1Signature,
 };
+use fastcrypto::traits::AllowedRng;
 pub use fastcrypto::traits::KeyPair as KeypairTraits;
 pub use fastcrypto::traits::{
     AggregateAuthenticator, Authenticator, EncodeDecodeBase64, SigningKey, ToFromBytes,
     VerifyingKey,
 };
 use fastcrypto::Verifier;
-use rand::rngs::OsRng;
+use rand::thread_rng;
 use roaring::RoaringBitmap;
 use schemars::JsonSchema;
 use serde::ser::Serializer;
@@ -523,14 +524,13 @@ where
     <KP as KeypairTraits>::PubKey: SuiPublicKey,
 {
     let mut items = num;
-    let mut rng = OsRng;
 
     std::iter::from_fn(|| {
         if items == 0 {
             None
         } else {
             items -= 1;
-            Some(get_key_pair_from_rng(&mut rng).1)
+            Some(get_key_pair_from_rng(&mut thread_rng()).1)
         }
     })
     .collect::<Vec<_>>()
@@ -542,7 +542,7 @@ pub fn get_key_pair<KP: KeypairTraits>() -> (SuiAddress, KP)
 where
     <KP as KeypairTraits>::PubKey: SuiPublicKey,
 {
-    get_key_pair_from_rng(&mut OsRng)
+    get_key_pair_from_rng(&mut thread_rng())
 }
 
 /// Wrapper function to return SuiKeypair based on key scheme string
@@ -573,7 +573,7 @@ pub fn get_authority_key_pair() -> (SuiAddress, AuthorityKeyPair) {
 /// Generate a keypair from the specified RNG (useful for testing with seedable rngs).
 pub fn get_key_pair_from_rng<KP: KeypairTraits, R>(csprng: &mut R) -> (SuiAddress, KP)
 where
-    R: rand::CryptoRng + rand::RngCore,
+    R: AllowedRng,
     <KP as KeypairTraits>::PubKey: SuiPublicKey,
 {
     let kp = KP::generate(csprng);
@@ -586,7 +586,7 @@ pub fn random_key_pair_by_type_from_rng<R>(
     csprng: &mut R,
 ) -> Result<(SuiAddress, SuiKeyPair), Error>
 where
-    R: rand::CryptoRng + rand::RngCore,
+    R: AllowedRng,
 {
     match key_scheme {
         SignatureScheme::Secp256k1 => {
