@@ -117,7 +117,7 @@ impl ConsensusState {
 
         let num_certs = certificates.len();
         for cert in certificates {
-            debug!("Re-inserting: {:?}", &cert);
+            info!("Inserting: {:?}", &cert);
             let _ = Self::try_insert_in_dag(&mut dag, last_committed, cert);
         }
         info!(

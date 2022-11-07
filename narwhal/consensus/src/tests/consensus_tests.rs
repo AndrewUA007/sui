@@ -18,7 +18,7 @@ use crate::Consensus;
 use types::{Certificate, ReconfigureNotification};
 
 #[tokio::test]
-async fn test_consensus_recovery() {
+async fn test_consensus_recovery_with_bullshark() {
     let _guard = setup_tracing();
 
     // GIVEN
@@ -82,15 +82,17 @@ async fn test_consensus_recovery() {
     // THEN we expect the first 4 ordered certificates to be from round 1 (they are the parents of the committed
     // leader) and the last committed to be the leader of round 2
     let mut consensus_index_counter = 0;
-    let num_of_committed_certificates = 5;
+    let expected_num_of_committed_certificates = 5;
 
-    for i in 1..=num_of_committed_certificates {
+    for i in 1..=expected_num_of_committed_certificates {
         let output = rx_output.recv().await.unwrap();
         assert_eq!(output.consensus_index, consensus_index_counter);
 
         if i < 5 {
             assert_eq!(output.certificate.round(), 1);
         } else {
+            // we expect to see the leader committed as well
+            // from round 2.
             assert_eq!(output.certificate.round(), 2);
         }
 
@@ -98,16 +100,16 @@ async fn test_consensus_recovery() {
     }
 
     // AND the last committed store should be updated correctly
-    // For the leader of round 2 we expect to have last committed record of 2.
-    // For the others should be 1.
     let last_committed = consensus_store.read_last_committed();
 
     for key in keys.clone() {
         let last_round = *last_committed.get(&key).unwrap();
 
+        // For the leader of round 2 we expect to have last committed round of 2.
         if key == Bullshark::leader_authority(&committee, 2) {
             assert_eq!(last_round, 2);
         } else {
+            // For the others should be 1.
             assert_eq!(last_round, 1);
         }
     }
@@ -115,7 +117,9 @@ async fn test_consensus_recovery() {
     // AND shutdown consensus
     consensus_handle.abort();
 
-    // AND bring up consensus again
+    // AND bring up consensus again. As part of the restore process we expect only the
+    // uncommitted certificates to be restored and consensus to continue committing
+    // certificates from where it left off - no replays should be seen.
     let (_tx_reconfigure, rx_reconfigure) = watch::channel(initial_committee);
     let (tx_waiter, rx_waiter) = test_utils::test_channel!(100);
     let (tx_primary, _rx_primary) = test_utils::test_channel!(100);
@@ -152,9 +156,6 @@ async fn test_consensus_recovery() {
 
     // WHEN we feed all certificates of round 5 to the consensus.
     while let Some(certificate) = certificates.pop_front() {
-        // we store the certificates so we can enable the recovery
-        // mechanism later.
-        certificate_store.write(certificate.clone()).unwrap();
         tx_waiter.send(certificate).await.unwrap();
     }
 
@@ -172,6 +173,8 @@ async fn test_consensus_recovery() {
     while let Some(output) = rx_output.recv().await {
         assert_eq!(output.consensus_index, consensus_index_counter);
 
+        // Every committed certificate should be strictly higher than
+        // the last_committed_round for this authority.
         let last_committed_round = last_committed
             .get(&output.certificate.header.author)
             .unwrap();
