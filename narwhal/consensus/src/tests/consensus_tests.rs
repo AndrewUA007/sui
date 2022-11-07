@@ -17,6 +17,16 @@ use crate::metrics::ConsensusMetrics;
 use crate::{Consensus, ConsensusOutput};
 use types::{Certificate, ReconfigureNotification};
 
+/// This test is trying to compare the output of the Consensus algorithm when:
+/// (1) running without any crash for certificates processed from round 1 to 5 (inclusive)
+/// (2) when a crash happens with last commit at round 2, and then consensus recovers
+///
+/// The output of (1) is compared to the output of (2) . The output of (2) is the combination
+/// of the output before the crash and after the crash. What we expect to see is the output of
+/// (1) & (2) be exactly the same. That will ensure:
+/// * no certificates re-commit happens
+/// * no certificates are skipped
+/// * no forks created
 #[tokio::test]
 async fn test_consensus_recovery_with_bullshark() {
     let _guard = setup_tracing();
