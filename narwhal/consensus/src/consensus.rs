@@ -22,6 +22,10 @@ use types::{
     Round, StoreResult, Timestamp,
 };
 
+#[cfg(test)]
+#[path = "tests/consensus_tests.rs"]
+pub mod consensus_tests;
+
 /// The representation of the DAG in memory.
 pub type Dag = HashMap<Round, HashMap<PublicKey, (CertificateDigest, Certificate)>>;
 
