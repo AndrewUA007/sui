@@ -6,7 +6,7 @@
 use fastcrypto::hash::Hash;
 use node::NodeStorage;
 use prometheus::Registry;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet};
 use std::sync::Arc;
 use telemetry_subscribers::TelemetryGuards;
 use test_utils::{temp_dir, CommitteeFixture};
@@ -14,7 +14,7 @@ use tokio::sync::watch;
 
 use crate::bullshark::Bullshark;
 use crate::metrics::ConsensusMetrics;
-use crate::Consensus;
+use crate::{Consensus, ConsensusOutput};
 use types::{Certificate, ReconfigureNotification};
 
 #[tokio::test]
@@ -31,17 +31,16 @@ async fn test_consensus_recovery_with_bullshark() {
     let fixture = CommitteeFixture::builder().build();
     let committee = fixture.committee();
 
-    // AND Make certificates for rounds 1 to 4. We expect the certificates on round 3
-    // to trigger a commit
+    // AND make certificates for rounds 1 to 5 (inclusive)
     let keys: Vec<_> = fixture.authorities().map(|a| a.public_key()).collect();
     let genesis = Certificate::genesis(&committee)
         .iter()
         .map(|x| x.digest())
         .collect::<BTreeSet<_>>();
-    let (mut certificates, next_parents) =
-        test_utils::make_optimal_certificates(&committee, 1..=4, &genesis, &keys);
+    let (certificates, _next_parents) =
+        test_utils::make_optimal_certificates(&committee, 1..=5, &genesis, &keys);
 
-    // AND Spawn the consensus engine and sink the primary channel.
+    // AND Spawn the consensus engine.
     let (tx_waiter, rx_waiter) = test_utils::test_channel!(100);
     let (tx_primary, _rx_primary) = test_utils::test_channel!(100);
     let (tx_output, mut rx_output) = test_utils::test_channel!(1);
@@ -72,31 +71,40 @@ async fn test_consensus_recovery_with_bullshark() {
     );
 
     // WHEN we feed all certificates to the consensus.
-    while let Some(certificate) = certificates.pop_front() {
+    for certificate in certificates.iter() {
         // we store the certificates so we can enable the recovery
         // mechanism later.
         certificate_store.write(certificate.clone()).unwrap();
-        tx_waiter.send(certificate).await.unwrap();
+        tx_waiter.send(certificate.clone()).await.unwrap();
     }
 
-    // THEN we expect the first 4 ordered certificates to be from round 1 (they are the parents of the committed
-    // leader) and the last committed to be the leader of round 2
+    // THEN we expect to have 2 leader election rounds (round = 2, and round = 4).
+    // In total we expect to have the following certificates get committed:
+    // * 4 certificates from round 1
+    // * 4 certificates from round 2
+    // * 4 certificates from round 3
+    // * 1 certificate from round 4 (the leader of last round)
+    //
+    // In total we should see 13 certificates committed
     let mut consensus_index_counter = 0;
-    let expected_num_of_committed_certificates = 5;
 
-    for i in 1..=expected_num_of_committed_certificates {
-        let output = rx_output.recv().await.unwrap();
+    // hold all the certificates that get committed when consensus runs
+    // without any crash.
+    let mut committed_output_no_crash: Vec<ConsensusOutput> = Vec::new();
+
+    while let Some(output) = rx_output.recv().await {
         assert_eq!(output.consensus_index, consensus_index_counter);
+        assert!(output.certificate.round() <= 4);
 
-        if i < 5 {
-            assert_eq!(output.certificate.round(), 1);
-        } else {
-            // we expect to see the leader committed as well
-            // from round 2.
-            assert_eq!(output.certificate.round(), 2);
-        }
+        committed_output_no_crash.push(output.clone());
 
         consensus_index_counter += 1;
+
+        // we received the leader of round 4, now stop as we don't expect to see any other
+        // certificate from that or higher round.
+        if output.certificate.round() == 4 {
+            break;
+        }
     }
 
     // AND the last committed store should be updated correctly
@@ -105,21 +113,90 @@ async fn test_consensus_recovery_with_bullshark() {
     for key in keys.clone() {
         let last_round = *last_committed.get(&key).unwrap();
 
-        // For the leader of round 2 we expect to have last committed round of 2.
-        if key == Bullshark::leader_authority(&committee, 2) {
-            assert_eq!(last_round, 2);
+        // For the leader of round 4 we expect to have last committed round of 4.
+        if key == Bullshark::leader_authority(&committee, 4) {
+            assert_eq!(last_round, 4);
         } else {
-            // For the others should be 1.
-            assert_eq!(last_round, 1);
+            // For the others should be 3.
+            assert_eq!(last_round, 3);
         }
     }
 
     // AND shutdown consensus
     consensus_handle.abort();
 
-    // AND bring up consensus again. As part of the restore process we expect only the
-    // uncommitted certificates to be restored and consensus to continue committing
-    // certificates from where it left off - no replays should be seen.
+    // AND bring up consensus again. Store is clean. Now send again the same certificates
+    // but up to round 3.
+    let (_tx_reconfigure, rx_reconfigure) = watch::channel(initial_committee.clone());
+    let (tx_waiter, rx_waiter) = test_utils::test_channel!(100);
+    let (tx_primary, _rx_primary) = test_utils::test_channel!(100);
+    let (tx_output, mut rx_output) = test_utils::test_channel!(1);
+
+    let storage = NodeStorage::reopen(temp_dir());
+
+    let consensus_store = storage.consensus_store;
+    let certificate_store = storage.certificate_store;
+
+    let bullshark = Bullshark::new(
+        committee.clone(),
+        consensus_store.clone(),
+        gc_depth,
+        metrics.clone(),
+    );
+
+    let consensus_handle = Consensus::spawn(
+        committee.clone(),
+        consensus_store.clone(),
+        certificate_store.clone(),
+        rx_reconfigure,
+        rx_waiter,
+        tx_primary,
+        tx_output,
+        bullshark,
+        metrics.clone(),
+        gc_depth,
+    );
+
+    // WHEN we send same certificates but up to round 3 (inclusive)
+    // Then we store all the certificates up to round 4 so we can let the recovery algorithm
+    // restore the consensus.
+    // We omit round 5 so we can feed those later after "crash" to trigger a new leader
+    // election round and commit.
+    for certificate in certificates.iter() {
+        if certificate.header.round <= 3 {
+            tx_waiter.send(certificate.clone()).await.unwrap();
+        }
+        if certificate.header.round <= 4 {
+            certificate_store.write(certificate.clone()).unwrap();
+        }
+    }
+
+    // THEN we expect to commit with a leader of round 2.
+    // So in total we expect to have committed certificates:
+    // * 4 certificates of round 1
+    // * 1 certificate of round 2 (the leader)
+    let mut consensus_index_counter = 0;
+    let mut committed_output_before_crash: Vec<ConsensusOutput> = Vec::new();
+
+    while let Some(output) = rx_output.recv().await {
+        assert_eq!(output.consensus_index, consensus_index_counter);
+        assert!(output.certificate.round() <= 2);
+
+        committed_output_before_crash.push(output.clone());
+
+        consensus_index_counter += 1;
+
+        // we received the leader of round 2, now stop as we don't expect to see any other
+        // certificate from that or higher round.
+        if output.certificate.round() == 2 {
+            break;
+        }
+    }
+
+    // AND shutdown (crash) consensus
+    consensus_handle.abort();
+
+    // AND bring up consensus again. Re-use the same store, so we can recover certificates
     let (_tx_reconfigure, rx_reconfigure) = watch::channel(initial_committee);
     let (tx_waiter, rx_waiter) = test_utils::test_channel!(100);
     let (tx_primary, _rx_primary) = test_utils::test_channel!(100);
@@ -145,56 +222,42 @@ async fn test_consensus_recovery_with_bullshark() {
         gc_depth,
     );
 
-    // AND create certificates at round 5. They should trigger a leader election
-    // for round 4 and commit anything before. However, no certificate from round < 2
-    // should be committed.
-    for key in keys {
-        let (_, certificate) =
-            test_utils::mock_certificate(&committee, key.clone(), 5, next_parents.clone());
-        certificates.push_back(certificate);
+    // WHEN send the certificates of round >= 5 to trigger a leader election for round 4
+    // and start committing.
+    for certificate in certificates.iter() {
+        if certificate.header.round >= 5 {
+            tx_waiter.send(certificate.clone()).await.unwrap();
+        }
     }
 
-    // WHEN we feed all certificates of round 5 to the consensus.
-    while let Some(certificate) = certificates.pop_front() {
-        tx_waiter.send(certificate).await.unwrap();
-    }
+    // AND capture the committed output
+    let mut committed_output_after_crash: Vec<ConsensusOutput> = Vec::new();
 
-    // THEN we expect to commit with a leader of round 4. Assuming a correct Consensus
-    // restore , we should not commit any certificate of index < 2.
-    // We expect to have committed in total:
-    // * 3 certificates of round 2 (since we already committed earlier its leader)
-    // * 4 certificates of round 3 (the parents of the leader)
-    // * 1 certificate of round 4 (the leader of the round)
-    //
-    // so totally 3 + 4 + 1 = 8 certificates
-    //
-    // Ensure committed certificates are all over the last committed rounds.
-    // Should continue from the last consensus index.
     while let Some(output) = rx_output.recv().await {
         assert_eq!(output.consensus_index, consensus_index_counter);
+        assert!(output.certificate.round() >= 2);
 
-        // Every committed certificate should be strictly higher than
-        // the last_committed_round for this authority.
-        let last_committed_round = last_committed
-            .get(&output.certificate.header.author)
-            .unwrap();
-        assert!(output.certificate.round() > *last_committed_round);
+        committed_output_after_crash.push(output.clone());
 
-        // we don't expect to see another committed certificate after that,
-        // so now just break
+        consensus_index_counter += 1;
+
+        // we received the leader of round 4, now stop as we don't expect to see any other
+        // certificate from that or higher round.
         if output.certificate.round() == 4 {
             break;
         }
-
-        consensus_index_counter += 1;
     }
 
-    // We expect to have committed:
-    // * 5 certificates before the consensus restart
-    // * 8 certificates after the consensus restart
-    // the index is zero based, so in the end we expect to see that we have assigned
-    // to the latest certificate the index 12.
-    assert_eq!(consensus_index_counter, 12);
+    // THEN compare the output from a non-Crashed consensus to the outputs produced by the
+    // crash consensus events. Those two should be exactly the same and will ensure that we see:
+    // * no certificate re-commits
+    // * no skips
+    // * no forks
+    committed_output_before_crash.append(&mut committed_output_after_crash);
+
+    let all_output_with_crash = committed_output_before_crash;
+
+    assert_eq!(committed_output_no_crash, all_output_with_crash);
 }
 
 fn setup_tracing() -> TelemetryGuards {
